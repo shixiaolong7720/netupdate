@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Train the lite2 KWS encoder for real@1FA/h and real+CW@20FA/h.
+"""Normal train/val/test training with low sample-FAR validation proxies.
 
 This is an independent training entry point. It never imports/runs the legacy
 training script, modifies source audio, or mines validation/test examples.
-FA/h here follows an independent-clip protocol, not continuous-stream events.
+FUKE_FAH belongs to the external post-quantization board-simulation workflow:
+it is never loaded here. Validation proxies are not measured board FA/h.
 See README_FAH_V2.md for data layout, commands and limitations.
 """
 from __future__ import annotations
@@ -25,8 +26,9 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
-from fah_data_v2 import FeatureDataset, TrainingPoolDataset, EpisodeBatchSampler
-from fah_metrics_v2 import calibrate_operating_points, evaluate_operating_points
+from fah_data_v2 import FeatureDataset, EpisodeBatchSampler
+from training_metrics_v2 import calibrate_training_points, evaluate_training_points
+from training_export_v2 import export_legacy_checkpoints
 from fah_model_v2 import (
     DualStream_DSCNN_TCN_AttPool_GE2E, TinyMFCCGate, GE2ELoss,
     BackgroundMetricLoss, dual_spec_augment, gate_spec_augment,
@@ -39,17 +41,18 @@ def parse_args(argv=None):
     root = r"D:\myproject\project\Data\Datafeature\2ch_wavelet_preemph_spec_rewake"
     p.add_argument("--train-dir", default=root + r"\train")
     p.add_argument("--val-dir", default=root + r"\val", help="Independent development/calibration set")
-    p.add_argument("--adapt-dir", help="Optional independent TRAINING adaptation pool; never val/test")
-    p.add_argument("--test-dir", help="Optional locked test root, e.g. FUKE_FAH with ID_* children")
-    p.add_argument("--allow-test-cw-substitute", action="store_true",
-                   help="Explicitly allow ID_1..20 instead of human ID_25 CW in a test report")
-    for split in ("train", "val", "adapt", "test"):
+    p.add_argument("--test-dir", default=root + r"\test", help="Ordinary floating-point test split; not FUKE_FAH")
+    p.add_argument("--skip-test", action="store_true", help="Train/validate only; otherwise evaluate ordinary test once at the end")
+    for split in ("train", "val", "test"):
         p.add_argument(f"--{split}-duration-manifest", help="CSV with sid,duration_sec; all examples required")
     p.add_argument("--sample-duration-sec", type=float, default=1.5,
                    help="Fallback duration of each independent clip if no manifest/NPZ metadata")
-    p.add_argument("--label-policy", choices=("strict", "folder"), default="strict",
-                   help="strict audits metadata before training; folder explicitly trusts verified ID folders and reports stale NPZ labels")
-    p.add_argument("--hours-json", help='Optional JSON {"val":{"real":hours,"real_cw":hours},"test":{...}}')
+    p.add_argument("--label-policy", choices=("strict", "folder"), default="folder",
+                   help="Folder labels match the original trainer; metadata conflicts remain audited. strict rejects any conflict")
+    p.add_argument("--ordinary-far", type=float, default=0.0005,
+                   help="Validation sample-FAR target for ordinary negatives; not board FA/h")
+    p.add_argument("--mixed-far", type=float, default=0.005,
+                   help="Validation sample-FAR target for all negatives including confusables; not board FA/h")
     p.add_argument("--verify-content-disjoint", action="store_true", help="Additionally SHA256-check NPZ duplicates across splits")
     p.add_argument("--output", help="New/empty output directory; never overwrites an existing run")
     p.add_argument("--init-checkpoint", help="Warm-start old/new model weights; optimizer is restarted")
@@ -94,7 +97,7 @@ def parse_args(argv=None):
     p.add_argument("--cl-patience", type=int, default=3)
     p.add_argument("--stability-weight", type=float, default=0.15)
     p.add_argument("--gate-cl-epochs", type=int, default=2,
-                   help="Optional environment-gate adaptation; same FAH acceptance and rollback")
+                   help="Environment-gate fine-tuning on train only; validation acceptance and rollback")
     p.add_argument("--cl-frr-tolerance", type=float, default=0.0,
                    help="Allowed absolute FRR regression per target vs incumbent; default none")
     p.add_argument("--smoke-test", action="store_true", help="Generate synthetic NPZs and exercise all training stages on CPU")
@@ -122,12 +125,20 @@ def parse_args(argv=None):
     for key in ("hard_positive_fraction", "hard_negative_fraction"):
         if not np.isfinite(getattr(args, key)) or not 0 <= getattr(args, key) <= 1:
             p.error(f"--{key.replace('_', '-')} must be in [0,1]")
+    for key in ("ordinary_far", "mixed_far"):
+        if not np.isfinite(getattr(args, key)) or not 0 <= getattr(args, key) <= 1:
+            p.error(f"--{key.replace('_', '-')} must be in [0,1]")
     if args.epochs == 0 and not (args.init_checkpoint or args.evaluate_checkpoint or args.smoke_test):
         p.error("--epochs 0 requires --init-checkpoint")
-    if args.evaluate_checkpoint and not args.test_dir:
-        p.error("--evaluate-checkpoint requires --test-dir")
+    if args.evaluate_checkpoint and args.skip_test:
+        p.error("--evaluate-checkpoint cannot be used with --skip-test")
     if args.init_checkpoint and args.evaluate_checkpoint:
         p.error("Choose training warm-start or checkpoint evaluation")
+    for split in ("train", "val", "test"):
+        path = str(getattr(args, split + "_dir")).replace("\\", "/")
+        if "fuke_fah" in (part.casefold() for part in path.split("/")):
+            p.error("FUKE_FAH is reserved for your external post-quantization board simulation. "
+                    "Use the ordinary 2ch_wavelet_preemph_spec_rewake train/val/test splits here.")
     return args
 
 
@@ -191,10 +202,10 @@ def collect_scores(model, gate, dataset, centroid, args, device, indices=None):
     return {"scores": scores, "gate_probs": gate_probs}
 
 
-def calibrate(outputs, dataset, args, hours, gate):
-    return calibrate_operating_points(outputs["scores"], outputs["gate_probs"], dataset.class_ids,
-                                     dataset.durations_sec, gate_candidates=args.gate_candidates,
-                                     negative_hours_override=hours, use_gate=gate is not None)
+def calibrate(outputs, dataset, args, gate):
+    return calibrate_training_points(outputs["scores"], outputs["gate_probs"], dataset.class_ids,
+                                    ordinary_far=args.ordinary_far, mixed_far=args.mixed_far,
+                                    gate_candidates=args.gate_candidates, use_gate=gate is not None)
 
 
 def objective(points):
@@ -211,8 +222,9 @@ def is_improved(candidate, incumbent, tolerance=None):
 def print_points(tag, points):
     for protocol in ("real", "real_cw"):
         m = points[protocol]
-        print(f"[{tag}/{protocol}] FRR={100*m['frr']:.3f}% | FA/h={m['fa_per_hour']:.4f} "
-              f"({m['fp']}/{m['negative_hours']:.4f}h) | gate={m['gate_threshold']:.6f} "
+        name = "ordinary" if protocol == "real" else "all_negatives_including_confusables"
+        print(f"[{tag}/{name}] proxy-FRR={100*m['frr']:.3f}% | sample-FAR={m['far']:.6f} "
+              f"({m['fp']}/{m['n_neg']}) | gate={m['gate_threshold']:.6f} "
               f"kws={m['kws_threshold']:.6f} | feasible={m['feasible']}", flush=True)
 
 
@@ -223,14 +235,18 @@ def append_history(out, record):
 
 def save_checkpoint(path, model, gate, centroid, points, args, stage, model_config):
     checkpoint = {
-        "version": "fah_v2", "model_config": model_config,
+        "version": "fah_v3_normal_training", "model_config": model_config,
         "kws_model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "gate_model": ({k: v.detach().cpu() for k, v in gate.state_dict().items()}
                        if gate is not None else None),
         "wake_centroid": centroid.detach().cpu(), "operating_points": points,
+        "gate_threshold": float(points["shared"]["gate_threshold"]),
+        "kws_threshold": float(points["shared"]["kws_threshold"]),
         "stage": stage, "args": vars(args),
         "decision": "(gate_probability >= gate_threshold) AND (unit_cosine >= kws_threshold)",
-        "measurement": "independent clips, at most one activation per clip; not streaming FA/h",
+        "measurement": "floating-point validation/test sample FAR; not quantized board FA/h",
+        "selection_mode": "training_sample_far_proxy",
+        "quantization_status": "pending_external_pipeline",
         "deployment_operating_point": "shared",
     }
     temp = Path(str(path) + ".tmp")
@@ -283,8 +299,7 @@ def predict_batch(model, gate, mfcc, logmel, mfcc_gate, centroid, operating_poin
 
 
 def thresholds_by_cid(points):
-    result = {cid: points["shared"]["kws_threshold"] for cid in range(26)}
-    result[21] = points["real"]["kws_threshold"]
+    result = {cid: points["real"]["kws_threshold"] for cid in range(26)}
     for cid in (*range(1, 21), 25):
         result[cid] = points["real_cw"]["kws_threshold"]
     result.pop(0)
@@ -303,10 +318,10 @@ def refresh_mining(model, gate, pool, sampler, centroid, points, args, device, e
     sampler.update_mining(scored["scores"], [points[p]["kws_threshold"] for p in ("real", "real_cw")],
                           gate_probs=scored["gate_probs"])
     append_history(Path(args.output), {"stage": "mining", "epoch": epoch, "summary": sampler.last_mining_summary})
-    print(f"[mining] scored {len(selected)}/{len(pool)} training/adaptation examples; no val/test mining", flush=True)
+    print(f"[mining] scored {len(selected)}/{len(pool)} training examples; no val/test/FUKE_FAH mining", flush=True)
 
 
-def train_kws(model, gate, pool, val, enrollment, points, args, device, out, hours,
+def train_kws(model, gate, pool, val, enrollment, points, args, device, out,
               model_config, *, stage="stage1", continual=False):
     epochs = args.cl_epochs if continual else args.epochs
     steps = args.cl_steps if continual else args.steps_per_epoch
@@ -386,7 +401,7 @@ def train_kws(model, gate, pool, val, enrollment, points, args, device, out, hou
         scheduler.step()
         centroid = build_centroid(model, enrollment, device)
         outputs = collect_scores(model, gate, val, centroid, args, device)
-        current = calibrate(outputs, val, args, hours, gate)
+        current = calibrate(outputs, val, args, gate)
         record = {"stage": stage, "epoch": epoch, "losses": {k: v / steps for k, v in sums.items()},
                   "episode_accuracy": episode_acc / max(1, episode_count),
                   "episode_margin": episode_margin / max(1, episode_count),
@@ -418,7 +433,7 @@ def train_kws(model, gate, pool, val, enrollment, points, args, device, out, hou
     return model, gate, centroid, best_points
 
 
-def train_gate(model, gate, pool, val, centroid, points, args, device, out, hours, model_config,
+def train_gate(model, gate, pool, val, centroid, points, args, device, out, model_config,
                *, stage="gate", continual=False):
     epochs = args.gate_cl_epochs if continual else args.gate_epochs
     if args.disable_gate or epochs == 0:
@@ -460,7 +475,7 @@ def train_gate(model, gate, pool, val, centroid, points, args, device, out, hour
             optimizer.step()
             total += float(loss.detach())
         outputs = collect_scores(model, gate, val, centroid, args, device)
-        current = calibrate(outputs, val, args, hours, gate)
+        current = calibrate(outputs, val, args, gate)
         append_history(out, {"stage": stage, "epoch": epoch, "loss": total / args.gate_steps, "metrics": current})
         print_points(stage, current)
         # Initial KWS-only solution is also a candidate: the gate must earn its place.
@@ -473,6 +488,15 @@ def train_gate(model, gate, pool, val, centroid, points, args, device, out, hour
             if stale >= args.gate_patience:
                 break
     loaded_gate, _, best = restore(path, model, device)
+    if loaded_gate is None:
+        # Preserve the trained Gate architecture for the existing quantization
+        # pipeline. All saved thresholds are zero here (the no-Gate baseline),
+        # so its probabilities pass unchanged while its weights remain exportable.
+        best = copy.deepcopy(best)
+        best["use_gate"] = True
+        best["gate_bypassed"] = True
+        loaded_gate = gate
+        save_checkpoint(path, model, loaded_gate, centroid, best, args, stage + "/trained_bypass", model_config)
     return loaded_gate, best
 
 
@@ -511,9 +535,9 @@ def assert_split_separation(datasets, verify_content=False):
 
 def create_smoke_data(args, out):
     rng = np.random.default_rng(args.seed)
-    for split in ("train", "val", "adapt", "test"):
+    for split in ("train", "val", "test"):
         root = out / "synthetic_features" / split
-        for cid in (0, 1, 2, 21, 22, 23, 24, 25):
+        for cid in (0, 1, 2, 21, 22, 23, 24):
             folder = root / f"ID_{cid}_{'CW' if cid == 25 else 'synthetic'}"
             folder.mkdir(parents=True)
             for i in range(4):
@@ -532,47 +556,25 @@ def create_smoke_data(args, out):
     args.gate_epochs, args.gate_steps, args.gate_batch_size = 1, 1, 8
     args.cl_rounds, args.cl_epochs, args.cl_steps, args.gate_cl_epochs = 1, 1, 2, 1
     args.gate_candidates, args.mining_per_class = 8, 4
-    print("SYNTHETIC SMOKE TEST: correctness/execution only, no accuracy or FA/h generalization claim.", flush=True)
+    print("SYNTHETIC SMOKE TEST: ordinary train/val/test only; no ID25 or FUKE_FAH required.", flush=True)
 
 
-def load_hours(path):
-    if not path:
-        return {}
-    value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    if not isinstance(value, dict) or any(k not in ("val", "test") for k in value):
-        raise ValueError("hours JSON may contain only val and test dictionaries")
-    for split, protocols in value.items():
-        if not isinstance(protocols, dict):
-            raise ValueError(f"{split} hours must be an object")
-        for protocol, hours in protocols.items():
-            if protocol not in ("real", "real_cw") or not np.isfinite(hours) or hours <= 0:
-                raise ValueError(f"Invalid negative hours: {split}/{protocol}")
-    return value
-
-
-def evaluate_checkpoint(args, out, device, hours):
+def evaluate_checkpoint(args, out, device):
     checkpoint = load_checkpoint(args.evaluate_checkpoint, device)
-    if checkpoint.get("version") != "fah_v2":
-        raise ValueError("Frozen-threshold evaluation requires a v2 checkpoint")
+    if checkpoint.get("selection_mode") != "training_sample_far_proxy":
+        raise ValueError("Use a normal-training checkpoint for frozen ordinary-test evaluation. "
+                         "Older checkpoints can be loaded with --init-checkpoint for training.")
     model = DualStream_DSCNN_TCN_AttPool_GE2E(**checkpoint["model_config"]).to(device)
     gate, centroid, points = restore(args.evaluate_checkpoint, model, device)
     if args.disable_gate and gate is not None:
         raise ValueError("Cannot change gate configuration during frozen-checkpoint evaluation")
     dataset = FeatureDataset(args.test_dir, args.sample_duration_sec, args.test_duration_manifest,
                              label_policy=args.label_policy, label_audit_path=out / "test_label_conflicts.csv")
-    check_test_protocol(dataset, args)
     outputs = collect_scores(model, gate, dataset, centroid, args, device)
-    metrics = evaluate_operating_points(outputs["scores"], outputs["gate_probs"], dataset.class_ids,
-                                       dataset.durations_sec, points, negative_hours_override=hours.get("test"))
+    metrics = evaluate_training_points(outputs["scores"], outputs["gate_probs"], dataset.class_ids, points)
     save_outputs(out, "test", outputs, dataset)
     write_json(out / "test_frozen_metrics.json", metrics)
     print_points("test-frozen", metrics)
-
-
-def check_test_protocol(dataset, args):
-    if not np.any(dataset.class_ids == 25) and not args.allow_test_cw_substitute:
-        raise ValueError("Human CW test requires ID_25_CW. For an explicitly labelled ID_1..20 "
-                         "surrogate report, pass --allow-test-cw-substitute")
 
 
 def main(argv=None):
@@ -591,23 +593,22 @@ def main(argv=None):
     args.output = str(out.resolve())
     device = setup_runtime(args)
     args.device = device.type
-    hours = load_hours(args.hours_json)
     write_json(out / "config.json", vars(args))
     write_json(out / "runtime.json", {"torch": str(torch.__version__), "numpy": np.__version__,
                                      "device": str(device), "synthetic": args.smoke_test})
     print(f"Output: {out.resolve()} | device={device}", flush=True)
+    print("Workflow: train=optimization/mining, val=selection/calibration, ordinary test=final FP32 evaluation. "
+          "FUKE_FAH is excluded; quantized board FA/h is evaluated separately.", flush=True)
     if args.evaluate_checkpoint:
-        evaluate_checkpoint(args, out, device, hours)
+        evaluate_checkpoint(args, out, device)
         return
     datasets = {}
-    for split in ("train", "val", "adapt", "test"):
-        root = getattr(args, split + "_dir")
+    for split in ("train", "val", "test"):
+        root = None if split == "test" and args.skip_test else getattr(args, split + "_dir")
         datasets[split] = (FeatureDataset(root, args.sample_duration_sec,
                                          getattr(args, split + "_duration_manifest"), label_policy=args.label_policy,
                                          label_audit_path=out / f"{split}_label_conflicts.csv") if root else None)
     assert_split_separation(datasets, args.verify_content_disjoint)
-    if datasets["test"] is not None:
-        check_test_protocol(datasets["test"], args)
     train, val = datasets["train"], datasets["val"]
     write_json(out / "data_summary.json", {
         name: {"root": str(getattr(args, name + "_dir")), "samples": len(ds),
@@ -615,6 +616,12 @@ def main(argv=None):
                "duration_sec_total": float(ds.durations_sec.sum()), "frames": ds.frames,
                "duration_source_counts": ds.duration_source_counts, "label_audit": ds.label_audit}
         for name, ds in datasets.items() if ds is not None})
+    write_json(out / "data_roles.json", {
+        "train": {"path": args.train_dir, "role": "parameter updates, hard-example mining, wake enrollment"},
+        "val": {"path": args.val_dir, "role": "checkpoint selection, early stopping, floating-point threshold calibration"},
+        "test": {"path": args.test_dir, "role": "one final ordinary floating-point test", "skipped": args.skip_test},
+        "post_quantization_board_test": {"dataset": "FUKE_FAH", "loaded_by_this_script": False},
+    })
     config = {"base_ch": args.base_ch, "embedding_dim": args.embedding_dim, "dropout": args.dropout}
     initial = load_checkpoint(args.init_checkpoint, device) if args.init_checkpoint else None
     if initial and "model_config" in initial:
@@ -635,20 +642,21 @@ def main(argv=None):
     selected = rng.choice(wake_indices, min(args.enrollment_samples, len(wake_indices)), replace=False)
     enrollment = make_loader(train, args, indices=selected)
     centroid = build_centroid(model, enrollment, device)
-    points = calibrate(collect_scores(model, gate, val, centroid, args, device), val, args, hours.get("val"), gate)
+    points = calibrate(collect_scores(model, gate, val, centroid, args, device), val, args, gate)
     print_points("initial-dev", points)
     model, gate, centroid, points = train_kws(model, gate, train, val, enrollment, points, args, device, out,
-                                               hours.get("val"), config)
-    gate, points = train_gate(model, gate, train, val, centroid, points, args, device, out, hours.get("val"), config)
-    # Adaptation is explicit. Never turn validation or test into training data.
-    pool = TrainingPoolDataset([train, datasets["adapt"]]) if datasets["adapt"] is not None else train
+                                               config)
+    gate, points = train_gate(model, gate, train, val, centroid, points, args, device, out, config)
+    # CL refreshes queues from the same training split. Neither val nor test can
+    # enter optimization, including the user's external quantization benchmark.
     for round_id in range(1, args.cl_rounds + 1):
         model, gate, centroid, points = train_kws(
-            model, gate, pool, val, enrollment, points, args, device, out, hours.get("val"), config,
+            model, gate, train, val, enrollment, points, args, device, out, config,
             stage=f"cl_{round_id:02d}", continual=True)
-        gate, points = train_gate(model, gate, pool, val, centroid, points, args, device, out,
-                                 hours.get("val"), config, stage=f"gate_cl_{round_id:02d}", continual=True)
+        gate, points = train_gate(model, gate, train, val, centroid, points, args, device, out,
+                                 config, stage=f"gate_cl_{round_id:02d}", continual=True)
     save_checkpoint(out / "best_system.pt", model, gate, centroid, points, args, "final", config)
+    export_legacy_checkpoints(out, model, gate, centroid, points, config, args)
     write_json(out / "operating_points.json", points)
     outputs = collect_scores(model, gate, val, centroid, args, device)
     save_outputs(out, "val", outputs, val)
@@ -656,13 +664,12 @@ def main(argv=None):
     if datasets["test"] is not None:
         test = datasets["test"]
         outputs = collect_scores(model, gate, test, centroid, args, device)
-        metrics = evaluate_operating_points(outputs["scores"], outputs["gate_probs"], test.class_ids,
-                                           test.durations_sec, points, negative_hours_override=hours.get("test"))
+        metrics = evaluate_training_points(outputs["scores"], outputs["gate_probs"], test.class_ids, points)
         save_outputs(out, "test", outputs, test)
         write_json(out / "test_frozen_metrics.json", metrics)
         print_points("test-frozen", metrics)
     else:
-        print("No --test-dir supplied: saved development metrics only; blind test not evaluated.", flush=True)
+        print("--skip-test selected: validation metrics saved; ordinary test was not evaluated.", flush=True)
     print(f"Completed. Checkpoint: {out.resolve() / 'best_system.pt'}", flush=True)
 
 
