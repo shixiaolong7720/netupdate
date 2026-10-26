@@ -1,0 +1,4 @@
+# Select the CPU or CUDA PyTorch build appropriate for your machine.
+# Install GPU PyTorch using https://pytorch.org/get-started/locally/ when needed.
+numpy>=1.24
+torch>=2.2
