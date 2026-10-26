@@ -23,6 +23,7 @@ train_mymodel_fah_v2.py     # 主训练与冻结评测入口
 fah_model_v2.py            # 原网络、GE2E、新损失
 fah_data_v2.py             # NPZ、时长、困难采样
 fah_metrics_v2.py          # 精确预算、联合校准、冻结阈值评测
+fah_labels_v2.py           # 训练前标签审计，也可单独用 NumPy 运行
 requirements_fah_v2.txt
 ```
 
@@ -60,6 +61,26 @@ ID0 是唤醒词。ID1～20 每个 ID 应对应一个固定词/短语，才能�
 `ID_25_noise` 被排除。ID25 的其他目录必须确实是混淆词。最终真人混淆词盲测默认要求 ID25；需要使用 ID1～20 替代评测时，显式传 `--allow-test-cw-substitute`，报告会标注替代协议。
 
 按说话人、原始录音来源划分 train/adapt/val/test，增强兄弟样本放在同一划分。脚本不自动拆分验证集或将其用于训练；会检查同一路径重复，可用 `--verify-content-disjoint` 增加 NPZ 字节级 SHA256 重复检查。内容检查不能识别经过重新压缩、裁切或增强的同源音频，仍需正确划分原始数据。
+
+### 文件夹 ID 与 NPZ class_id 不一致
+
+旧训练脚本以 `ID_*` 文件夹作为类别。部分旧特征在重分类、移动或复用后，NPZ 内的 `class_id`/`label` 可能仍是旧值。也可能是文件确实被放错目录；仅凭报错无法判断哪一方正确。
+
+新版默认 `--label-policy strict`：加载时完整检查标签元数据，训练前报出实际存储值、文件夹期望值以及冲突总数。每个 split 的详细记录写入输出目录的 `train_label_conflicts.csv`、`val_label_conflicts.csv` 等。原始 NPZ 不会被修改。
+
+可先用不依赖 PyTorch 的只读审计命令查看整个训练/验证集：
+
+```text
+python fah_labels_v2.py --root "D:\myproject\project\Data\Datafeature\2ch_wavelet_preemph_spec_rewake\train" --root "D:\myproject\project\Data\Datafeature\2ch_wavelet_preemph_spec_rewake\val" --report-dir "D:\runs\label_audit01"
+```
+
+审计会输出 CSV 和 `label_audit_summary.json`；发现冲突时退出码为 1，表示发现数据问题，报告仍完整保存。`wake_nonwake_conflict` 代表正负样本语义冲突，应重点核查原始标注/音频。没有冲突时退出码为 0。
+
+**只有确认文件夹分类正确、NPZ 元数据过期后**，才在训练命令后加 `--label-policy folder`。该选项明确按文件夹生成类别及二值标签，保留警告、完整 CSV 和 `data_summary.json` 审计摘要；不跳过样本、不重写 NPZ。如果文件夹放错，应先根据原始标注修正数据归类。
+
+```text
+python train_mymodel_fah_v2.py --label-policy folder --test-dir "D:\myproject\project\Data\Datafeature\FUKE_FAH" --output "D:\runs\fah_v2_run02"
+```
 
 ### FA/h 的时长口径
 

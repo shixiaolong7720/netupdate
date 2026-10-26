@@ -47,6 +47,8 @@ def parse_args(argv=None):
         p.add_argument(f"--{split}-duration-manifest", help="CSV with sid,duration_sec; all examples required")
     p.add_argument("--sample-duration-sec", type=float, default=1.5,
                    help="Fallback duration of each independent clip if no manifest/NPZ metadata")
+    p.add_argument("--label-policy", choices=("strict", "folder"), default="strict",
+                   help="strict audits metadata before training; folder explicitly trusts verified ID folders and reports stale NPZ labels")
     p.add_argument("--hours-json", help='Optional JSON {"val":{"real":hours,"real_cw":hours},"test":{...}}')
     p.add_argument("--verify-content-disjoint", action="store_true", help="Additionally SHA256-check NPZ duplicates across splits")
     p.add_argument("--output", help="New/empty output directory; never overwrites an existing run")
@@ -556,7 +558,8 @@ def evaluate_checkpoint(args, out, device, hours):
     gate, centroid, points = restore(args.evaluate_checkpoint, model, device)
     if args.disable_gate and gate is not None:
         raise ValueError("Cannot change gate configuration during frozen-checkpoint evaluation")
-    dataset = FeatureDataset(args.test_dir, args.sample_duration_sec, args.test_duration_manifest)
+    dataset = FeatureDataset(args.test_dir, args.sample_duration_sec, args.test_duration_manifest,
+                             label_policy=args.label_policy, label_audit_path=out / "test_label_conflicts.csv")
     check_test_protocol(dataset, args)
     outputs = collect_scores(model, gate, dataset, centroid, args, device)
     metrics = evaluate_operating_points(outputs["scores"], outputs["gate_probs"], dataset.class_ids,
@@ -600,7 +603,8 @@ def main(argv=None):
     for split in ("train", "val", "adapt", "test"):
         root = getattr(args, split + "_dir")
         datasets[split] = (FeatureDataset(root, args.sample_duration_sec,
-                                         getattr(args, split + "_duration_manifest")) if root else None)
+                                         getattr(args, split + "_duration_manifest"), label_policy=args.label_policy,
+                                         label_audit_path=out / f"{split}_label_conflicts.csv") if root else None)
     assert_split_separation(datasets, args.verify_content_disjoint)
     if datasets["test"] is not None:
         check_test_protocol(datasets["test"], args)
@@ -609,7 +613,7 @@ def main(argv=None):
         name: {"root": str(getattr(args, name + "_dir")), "samples": len(ds),
                "class_counts": {str(int(cid)): int(np.sum(ds.class_ids == cid)) for cid in np.unique(ds.class_ids)},
                "duration_sec_total": float(ds.durations_sec.sum()), "frames": ds.frames,
-               "duration_source_counts": ds.duration_source_counts}
+               "duration_source_counts": ds.duration_source_counts, "label_audit": ds.label_audit}
         for name, ds in datasets.items() if ds is not None})
     config = {"base_ch": args.base_ch, "embedding_dim": args.embedding_dim, "dropout": args.dropout}
     initial = load_checkpoint(args.init_checkpoint, device) if args.init_checkpoint else None

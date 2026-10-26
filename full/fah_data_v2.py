@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
+from fah_labels_v2 import LabelAudit, inspect_label_metadata
+
 
 def _positive_duration(value: object, context: str) -> float:
     array = np.asarray(value)
@@ -55,47 +57,59 @@ class FeatureDataset(Dataset):
         root: str | Path,
         default_duration_sec: float = 1.5,
         duration_manifest: str | Path | None = None,
+        label_policy: str = "strict",
+        label_audit_path: str | Path | None = None,
     ):
         self.root = Path(root).expanduser().resolve()
         self.root_dir = str(self.root)
         if not self.root.is_dir():
             raise FileNotFoundError(f"Feature root does not exist: {self.root}")
         self.default_duration_sec = _positive_duration(default_duration_sec, "default_duration_sec")
+        self.label_policy = label_policy
         manifest = _load_duration_manifest(duration_manifest) if duration_manifest is not None else None
         paths, class_ids, sids, durations, duration_sources = [], [], [], [], []
         excluded_noise = 0
-        for folder in sorted(self.root.iterdir(), key=lambda p: p.name):
-            if not folder.is_dir() or not folder.name.startswith("ID_"):
-                continue
-            if folder.name.casefold() == "id_25_noise":
-                excluded_noise += sum(1 for _ in folder.glob("*.npz"))
-                continue
-            parts = folder.name.split("_")
-            try:
-                cid = int(parts[1])
-            except (ValueError, IndexError):
-                continue
-            if cid < 0:
-                raise ValueError(f"Negative class ID is invalid: {folder}")
-            for path in sorted(folder.glob("*.npz"), key=lambda p: p.name):
-                sid = path.relative_to(self.root).as_posix()
-                if manifest is not None:
-                    if sid not in manifest:
-                        raise ValueError(f"Duration manifest has no entry for {sid!r} in {self.root}")
-                    duration, source = manifest[sid], "manifest"
-                else:
-                    # np.load is lazy: this does not materialize feature arrays.
+        audit = LabelAudit(label_policy, label_audit_path)
+        try:
+            for folder in sorted(self.root.iterdir(), key=lambda p: p.name):
+                if not folder.is_dir() or not folder.name.startswith("ID_"):
+                    continue
+                if folder.name.casefold() == "id_25_noise":
+                    excluded_noise += sum(1 for _ in folder.glob("*.npz"))
+                    continue
+                parts = folder.name.split("_")
+                try:
+                    cid = int(parts[1])
+                except (ValueError, IndexError):
+                    continue
+                if cid < 0:
+                    raise ValueError(f"Negative class ID is invalid: {folder}")
+                for path in sorted(folder.glob("*.npz"), key=lambda p: p.name):
+                    sid = path.relative_to(self.root).as_posix()
+                    # Read metadata once during the existing directory scan.
+                    # No feature array is materialized here; report all label
+                    # conflicts before enrollment, calibration or optimization.
                     with np.load(path, allow_pickle=False) as data:
-                        if "duration_sec" in data.files:
+                        audit.record(data, cid, path, sid)
+                        if manifest is not None:
+                            if sid not in manifest:
+                                raise ValueError(f"Duration manifest has no entry for {sid!r} in {self.root}")
+                            duration, source = manifest[sid], "manifest"
+                        elif "duration_sec" in data.files:
                             duration = _positive_duration(data["duration_sec"], str(path))
                             source = "npz"
                         else:
                             duration, source = self.default_duration_sec, "default"
-                paths.append(str(path))
-                class_ids.append(cid)
-                sids.append(sid)
-                durations.append(duration)
-                duration_sources.append(source)
+                    paths.append(str(path))
+                    class_ids.append(cid)
+                    sids.append(sid)
+                    durations.append(duration)
+                    duration_sources.append(source)
+                    if len(paths) % 10000 == 0:
+                        print(f"[Metadata scan] {self.root.name}: {len(paths)} files", flush=True)
+        finally:
+            audit.close()
+        self.label_audit = audit.finish()
 
         if not paths:
             raise ValueError(f"No usable NPZ features under {self.root}")
@@ -147,10 +161,14 @@ class FeatureDataset(Dataset):
                 if not np.all(np.isfinite(array)):
                     raise ValueError(f"{path}: {key} contains NaN or infinity")
                 features.append(torch.from_numpy(np.ascontiguousarray(array)).unsqueeze(0))
-            if "class_id" in data.files:
-                stored_cid = np.asarray(data["class_id"])
-                if stored_cid.size != 1 or int(stored_cid.reshape(-1)[0]) != int(self.class_ids[index]):
-                    raise ValueError(f"{path}: stored class_id disagrees with its ID folder")
+            if self.label_policy == "strict":
+                # Detect changes to metadata after the constructor audit too.
+                issues = inspect_label_metadata(data, int(self.class_ids[index]))
+                if issues:
+                    first = issues[0]
+                    raise ValueError(f"{path}: stored {first['field']}={first['stored_value']} "
+                                     f"disagrees with folder expected {first['folder_expected']}; "
+                                     "metadata changed after the preflight label audit")
         return (
             *features,
             torch.tensor(float(self.labels[index]), dtype=torch.float32),
